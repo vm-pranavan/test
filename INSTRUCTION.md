@@ -16,6 +16,292 @@ Each service is a Node.js/Express app that uses MongoDB for persistence. The pro
 - Each service has its own MongoDB database (separate containers in docker-compose): `mongodb-rider`, `mongodb-driver`, `mongodb-trip`, `mongodb-payment`.
 - All services implement a lightweight request correlation header `X-Correlation-Id` and structured logs with Winston.
 
+## Architecture Diagrams
+
+### System Architecture Overview
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        Client[API Clients<br/>Web/Mobile/Third-party]
+    end
+    
+    subgraph "Application Layer - Microservices"
+        subgraph "Rider Service :3001"
+            RS[Rider API<br/>Express.js]
+            RSL[Winston Logger]
+        end
+        
+        subgraph "Driver Service :3002"
+            DS[Driver API<br/>Express.js]
+            DSL[Winston Logger]
+        end
+        
+        subgraph "Trip Service :3003"
+            TS[Trip API<br/>Express.js]
+            TSL[Winston Logger]
+        end
+        
+        subgraph "Payment Service :3004"
+            PS[Payment API<br/>Express.js]
+            PSL[Winston Logger]
+        end
+    end
+    
+    subgraph "Data Layer - MongoDB Databases"
+        RDB[(rider_db<br/>MongoDB)]
+        DDB[(driver_db<br/>MongoDB)]
+        TDB[(trip_db<br/>MongoDB)]
+        PDB[(payment_db<br/>MongoDB)]
+    end
+    
+    subgraph "Monitoring Layer"
+        ME1[Mongo Express<br/>:8081]
+        ME2[Mongo Express<br/>:8082]
+        ME3[Mongo Express<br/>:8083]
+        ME4[Mongo Express<br/>:8084]
+    end
+    
+    Client -->|HTTP REST| RS
+    Client -->|HTTP REST| DS
+    Client -->|HTTP REST| TS
+    Client -->|HTTP REST| PS
+    
+    RS -->|CRUD| RDB
+    DS -->|CRUD| DDB
+    TS -->|CRUD| TDB
+    PS -->|CRUD| PDB
+    
+    RS -.->|Log| RSL
+    DS -.->|Log| DSL
+    TS -.->|Log| TSL
+    PS -.->|Log| PSL
+    
+    ME1 -.->|Monitor| RDB
+    ME2 -.->|Monitor| DDB
+    ME3 -.->|Monitor| TDB
+    ME4 -.->|Monitor| PDB
+    
+    TS -->|Validate| RS
+    TS -->|Assign/Update| DS
+    TS -->|Charge| PS
+    PS -->|Verify| TS
+    PS -->|Validate| RS
+    
+    style RDB fill:#4CAF50
+    style DDB fill:#2196F3
+    style TDB fill:#FF9800
+    style PDB fill:#9C27B0
+    style Client fill:#607D8B
+```
+
+### Service Intercommunication Flow
+
+```mermaid
+graph LR
+    subgraph "External"
+        API[API Consumer]
+    end
+    
+    subgraph "Rider Service"
+        R[Rider API<br/>:3001]
+        RDB[(rider_db)]
+    end
+    
+    subgraph "Driver Service"
+        D[Driver API<br/>:3002]
+        DDB[(driver_db)]
+    end
+    
+    subgraph "Trip Service"
+        T[Trip API<br/>:3003]
+        TDB[(trip_db)]
+    end
+    
+    subgraph "Payment Service"
+        P[Payment API<br/>:3004]
+        PDB[(payment_db)]
+    end
+    
+    API -->|1. Create Rider| R
+    API -->|2. Create Driver| D
+    API -->|3. Request Trip| T
+    API -->|4. Accept Trip| T
+    API -->|5. Complete Trip| T
+    
+    R <-->|Own Data| RDB
+    D <-->|Own Data| DDB
+    T <-->|Own Data| TDB
+    P <-->|Own Data| PDB
+    
+    T -->|GET /v1/riders/:id<br/>Validate Rider| R
+    T -->|GET /v1/drivers/active<br/>Assign Driver| D
+    T -->|PATCH /v1/drivers/:id/status<br/>Update Availability| D
+    T -->|POST /v1/payments/charge<br/>Process Payment| P
+    
+    P -->|GET /v1/trips/:id<br/>Verify Completed| T
+    P -->|GET /v1/riders/:id<br/>Validate Rider| R
+    
+    style R fill:#4CAF50
+    style D fill:#2196F3
+    style T fill:#FF9800
+    style P fill:#9C27B0
+```
+
+### Trip Lifecycle Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant TripService
+    participant RiderService
+    participant DriverService
+    participant PaymentService
+    
+    Note over Client,PaymentService: Complete Trip Flow
+    
+    Client->>TripService: POST /v1/trips<br/>{rider_id, coordinates}
+    TripService->>RiderService: GET /v1/riders/:id
+    RiderService-->>TripService: Rider Details
+    TripService->>DriverService: GET /v1/drivers/active
+    DriverService-->>TripService: Active Drivers List
+    TripService->>TripService: Calculate fare & assign driver
+    TripService-->>Client: Trip Created (REQUESTED)
+    
+    Client->>TripService: POST /v1/trips/:id/accept<br/>{driver_id}
+    TripService->>DriverService: GET /v1/drivers/:id
+    DriverService-->>TripService: Driver Details
+    TripService->>DriverService: PATCH /v1/drivers/:id/status<br/>{is_active: false}
+    DriverService-->>TripService: Driver Updated
+    TripService-->>Client: Trip Accepted
+    
+    Client->>TripService: POST /v1/trips/:id/complete
+    TripService->>TripService: Update status to COMPLETED
+    TripService->>PaymentService: POST /v1/payments/charge<br/>{trip_id, rider_id, amount}
+    PaymentService->>TripService: GET /v1/trips/:id
+    TripService-->>PaymentService: Trip Details (COMPLETED)
+    PaymentService->>RiderService: GET /v1/riders/:id
+    RiderService-->>PaymentService: Rider Details
+    PaymentService->>PaymentService: Process Payment & Generate Receipt
+    PaymentService-->>TripService: Payment Result
+    TripService->>DriverService: PATCH /v1/drivers/:id/status<br/>{is_active: true}
+    DriverService-->>TripService: Driver Reactivated
+    TripService-->>Client: Trip Completed + Payment Details
+```
+
+### Data Flow Architecture
+
+```mermaid
+flowchart TD
+    Start([Client Request]) --> Gateway{Which Service?}
+    
+    Gateway -->|Rider Operations| RiderFlow[Rider Service]
+    Gateway -->|Driver Operations| DriverFlow[Driver Service]
+    Gateway -->|Trip Operations| TripFlow[Trip Service]
+    Gateway -->|Payment Operations| PaymentFlow[Payment Service]
+    
+    RiderFlow --> RiderDB[(rider_db<br/>riders<br/>payment_instruments)]
+    DriverFlow --> DriverDB[(driver_db<br/>drivers<br/>vehicles)]
+    TripFlow --> TripDB[(trip_db<br/>trips)]
+    PaymentFlow --> PaymentDB[(payment_db<br/>payments<br/>receipts)]
+    
+    TripFlow -.->|Validate| RiderFlow
+    TripFlow -.->|Assign/Update| DriverFlow
+    TripFlow -.->|Charge| PaymentFlow
+    
+    PaymentFlow -.->|Verify| TripFlow
+    PaymentFlow -.->|Validate| RiderFlow
+    
+    RiderDB --> Response([JSON Response + X-Correlation-Id])
+    DriverDB --> Response
+    TripDB --> Response
+    PaymentDB --> Response
+    
+    Response --> Logging[Winston Logs]
+    
+    style RiderDB fill:#4CAF50
+    style DriverDB fill:#2196F3
+    style TripDB fill:#FF9800
+    style PaymentDB fill:#9C27B0
+```
+
+### Deployment Architecture (Docker Compose)
+
+```mermaid
+graph TB
+    subgraph "Docker Network: ride-sharing-network"
+        subgraph "Service Containers"
+            RS[rider-service<br/>Port: 3001<br/>Image: Node 18 Alpine]
+            DS[driver-service<br/>Port: 3002<br/>Image: Node 18 Alpine]
+            TS[trip-service<br/>Port: 3003<br/>Image: Node 18 Alpine]
+            PS[payment-service<br/>Port: 3004<br/>Image: Node 18 Alpine]
+        end
+        
+        subgraph "Database Containers"
+            MR[mongodb-rider<br/>Port: 27017<br/>Image: mongo:6.0]
+            MD[mongodb-driver<br/>Port: 27017<br/>Image: mongo:6.0]
+            MT[mongodb-trip<br/>Port: 27017<br/>Image: mongo:6.0]
+            MP[mongodb-payment<br/>Port: 27017<br/>Image: mongo:6.0]
+        end
+        
+        subgraph "Monitoring Containers"
+            MER[mongo-express-rider<br/>Port: 8081]
+            MED[mongo-express-driver<br/>Port: 8082]
+            MET[mongo-express-trip<br/>Port: 8083]
+            MEP[mongo-express-payment<br/>Port: 8084]
+        end
+        
+        RS --> MR
+        DS --> MD
+        TS --> MT
+        PS --> MP
+        
+        MER -.-> MR
+        MED -.-> MD
+        MET -.-> MT
+        MEP -.-> MP
+        
+        TS -.->|HTTP| RS
+        TS -.->|HTTP| DS
+        TS -.->|HTTP| PS
+        PS -.->|HTTP| TS
+        PS -.->|HTTP| RS
+    end
+    
+    subgraph "Host Machine"
+        Host[localhost]
+    end
+    
+    Host -->|:3001| RS
+    Host -->|:3002| DS
+    Host -->|:3003| TS
+    Host -->|:3004| PS
+    Host -->|:8081-8084| MER
+    
+    subgraph "Persistent Volumes"
+        VR[mongodb_rider_data]
+        VD[mongodb_driver_data]
+        VT[mongodb_trip_data]
+        VP[mongodb_payment_data]
+    end
+    
+    MR -.-> VR
+    MD -.-> VD
+    MT -.-> VT
+    MP -.-> VP
+```
+
+### Key Architecture Principles
+
+1. **Database per Service**: Each microservice has its own MongoDB instance
+2. **Service Independence**: Services can be deployed, scaled, and updated independently
+3. **Loose Coupling**: Services communicate via REST APIs (HTTP)
+4. **Eventual Consistency**: No distributed transactions; services validate via API calls
+5. **Correlation Tracking**: X-Correlation-Id header propagates through all service calls
+6. **Health Monitoring**: Each service exposes /health endpoint
+7. **Containerization**: All services and databases run in Docker containers
+8. **Idempotency**: Payment service supports idempotent operations
+
 ## Common patterns & cross-cutting concerns
 
 - Health endpoint: `GET /health` returns service status.
